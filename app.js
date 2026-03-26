@@ -898,6 +898,8 @@ async function handlePayment(e) {
     });
 
     const order = await orderResponse.json();
+    console.log('📋 Order creation response:', order);
+
     if (!order.id || !order.amount) {
       throw new Error('Invalid order data received from server');
     }
@@ -926,6 +928,8 @@ async function handlePayment(e) {
       prefill: customerInfo,
       theme: { color: '#d97706' },
       handler: async (response) => {
+        console.log('💳 Payment completed! Response:', response);
+
         try {
           showToast('Verifying payment...', 'info');
 
@@ -944,21 +948,25 @@ async function handlePayment(e) {
           });
 
           const verifyResult = await verifyResponse.json();
+          console.log('🔐 Payment verification response:', verifyResult);
 
           if (verifyResult.success) {
+            console.log('✅ Payment verification successful, clearing cart and redirecting...');
             Cart.clearCart();
             showToast('Payment successful! Redirecting...', 'success');
             setTimeout(() => Router.navigate('#/success'), 1500);
           } else {
+            console.error('❌ Payment verification failed:', verifyResult.message);
             throw new Error(verifyResult.message || 'Payment verification failed');
           }
         } catch (error) {
-          console.error('Verification error:', error);
+          console.error('❌ Verification error:', error);
           showToast('Payment verification failed. Please contact support if amount was debited.', 'error');
         }
       },
       modal: {
         ondismiss: () => {
+          console.log('❌ Payment modal dismissed by user');
           showToast('Payment cancelled', 'info');
           btn.disabled = false;
           btn.innerHTML = originalText;
@@ -976,8 +984,24 @@ async function handlePayment(e) {
     };
 
     // Step 7: Open Razorpay checkout
+    console.log('🚀 Opening Razorpay checkout with options:', {
+      key: razorpayKeyId.substring(0, 10) + '...',
+      amount: order.amount,
+      currency: order.currency || 'INR',
+      order_id: order.id
+    });
+
     showToast('Opening payment gateway...', 'info');
     const razorpayInstance = new window.Razorpay(options);
+
+    // Add payment failed event handler
+    razorpayInstance.on('payment.failed', function(response) {
+      console.error('❌ Payment failed:', response.error);
+      showToast(`Payment failed: ${response.error.description || 'Unknown error'}`, 'error');
+      btn.disabled = false;
+      btn.innerHTML = originalText;
+    });
+
     razorpayInstance.open();
 
   } catch (error) {
