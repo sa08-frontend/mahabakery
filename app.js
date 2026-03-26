@@ -191,7 +191,6 @@ function initHeroScene(canvas) {
     scene.add(m);
     floaters.push({ m, spd: 0.3 + Math.random() * 0.4, off: Math.random() * Math.PI * 2 });
   }
-  // tiny chips
   for (let i = 0; i < 15; i++) {
     const chip = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 8), new THREE.MeshStandardMaterial({ color: '#1a0f0a' }));
     chip.position.set((Math.random() - .5) * 14, (Math.random() - .5) * 12, (Math.random() - .5) * 8);
@@ -241,7 +240,6 @@ function initProductScene(canvas, product) {
 
   setupLights(scene);
 
-  // Shadow plane
   const plane = new THREE.Mesh(
     new THREE.PlaneGeometry(12, 12),
     new THREE.ShadowMaterial({ opacity: 0.25 })
@@ -308,7 +306,6 @@ function initFooterScene(canvas) {
     renderer.render(scene, camera);
   };
   tick();
-  // Footer scene is NOT tracked (persists across pages)
   return () => { cancelAnimationFrame(raf); renderer.dispose(); };
 }
 
@@ -467,7 +464,6 @@ function mountProductScenes(products) {
     initProductScene(canvas, p);
   });
 
-  // Qty controls
   document.querySelectorAll('[data-action]').forEach(btn => {
     btn.addEventListener('click', () => {
       const id = btn.dataset.pid;
@@ -478,7 +474,6 @@ function mountProductScenes(products) {
     });
   });
 
-  // Add to cart
   document.querySelectorAll('[data-add]').forEach(btn => {
     btn.addEventListener('click', () => {
       const id = btn.dataset.add;
@@ -786,8 +781,92 @@ function renderCheckout() {
   document.getElementById('co-form')?.addEventListener('submit', handlePayment);
 }
 
+/* ==================== RAZORPAY LOADER ==================== */
+function loadRazorpayScript() {
+  return new Promise((resolve, reject) => {
+    // Already loaded
+    if (window.Razorpay) {
+      console.log('[Payment] Razorpay SDK already loaded');
+      return resolve();
+    }
+    console.log('[Payment] Loading Razorpay SDK...');
+    const script = document.createElement('script');
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.async = true;
+    script.onload = () => {
+      console.log('[Payment] Razorpay SDK loaded successfully');
+      resolve();
+    };
+    script.onerror = () => {
+      console.error('[Payment] Failed to load Razorpay SDK');
+      reject(new Error('Failed to load Razorpay SDK. Check your internet connection.'));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+/* ==================== PAYMENT VERIFICATION ==================== */
+async function verifyAndRedirect(paymentResponse) {
+  console.log('[Payment] Starting verification...', {
+    order_id: paymentResponse.razorpay_order_id,
+    payment_id: paymentResponse.razorpay_payment_id,
+  });
+
+  try {
+    const res = await fetch('/api/verify-payment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(paymentResponse),
+    });
+
+    console.log('[Payment] Verify response status:', res.status);
+
+    let result;
+    try {
+      result = await res.json();
+    } catch (parseErr) {
+      console.error('[Payment] Failed to parse verify response:', parseErr);
+      throw new Error('Invalid response from payment server');
+    }
+
+    console.log('[Payment] Verify result:', result);
+
+    if (res.ok && result.success) {
+      console.log('[Payment] ✅ Verification successful — clearing cart and redirecting');
+      Cart.clearCart();
+      showToast('Payment successful! Redirecting...', 'success');
+
+      // Use direct hash assignment to guarantee navigation
+      // This bypasses any router state issues
+      setTimeout(() => {
+        console.log('[Payment] Navigating to success page...');
+        // Dispose scenes first, then navigate
+        disposeAllScenes();
+        // Force hash change to trigger router
+        if (window.location.hash === '#/success') {
+          // Hash is already correct — manually render
+          renderSuccess();
+          updateCartBadge();
+        } else {
+          window.location.hash = '#/success';
+        }
+      }, 800);
+    } else {
+      const errMsg = result.message || result.error || 'Payment verification failed';
+      console.error('[Payment] ❌ Verification failed:', errMsg);
+      throw new Error(errMsg);
+    }
+  } catch (err) {
+    console.error('[Payment] Verification error:', err);
+    showToast(`Verification failed: ${err.message}. Please contact support.`, 'error');
+  }
+}
+
+/* ==================== HANDLE PAYMENT ==================== */
 async function handlePayment(e) {
   e.preventDefault();
+  console.log('[Payment] Form submitted');
+
   const btn = document.getElementById('pay-btn');
   const total = Cart.getTotal();
 
@@ -797,114 +876,152 @@ async function handlePayment(e) {
   }
 
   btn.disabled = true;
-  const originalText = btn.innerHTML;
+  const originalHTML = btn.innerHTML;
   btn.innerHTML = '<div class="spinner"></div> Processing...';
 
   try {
-    // Load Razorpay script if not loaded
-    if (!window.Razorpay) {
-      showToast('Loading payment gateway...', 'info');
-      await new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = 'https://checkout.razorpay.com/v1/checkout.js';
-        script.onload = resolve;
-        script.onerror = () => reject(new Error('Failed to load Razorpay'));
-        document.head.appendChild(script);
-      });
+    // Step 1: Load Razorpay SDK
+    await loadRazorpayScript();
+
+    // Step 2: Fetch Razorpay public key from backend
+    console.log('[Payment] Fetching config from /api/config...');
+    const configRes = await fetch('/api/config');
+    if (!configRes.ok) {
+      const errData = await configRes.json().catch(() => ({}));
+      throw new Error(errData.error || `Config endpoint returned ${configRes.status}`);
+    }
+    const { razorpayKeyId } = await configRes.json();
+    console.log('[Payment] Got razorpayKeyId:', razorpayKeyId ? '✅ present' : '❌ missing');
+
+    if (!razorpayKeyId) {
+      throw new Error('Razorpay key not returned from server');
     }
 
-    // Fetch Razorpay config
-    showToast('Initializing payment...', 'info');
-    const configResponse = await fetch('/api/config');
-    if (!configResponse.ok) {
-      const configError = await configResponse.json().catch(() => ({}));
-      throw new Error(configError.error || 'Payment configuration failed');
-    }
-    const { razorpayKeyId } = await configResponse.json();
-
-    // Create order
-    const orderResponse = await fetch('/api/create-order', {
+    // Step 3: Create Razorpay order on backend
+    console.log('[Payment] Creating order for amount:', total);
+    const orderRes = await fetch('/api/create-order', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount: total }),
     });
 
-    if (!orderResponse.ok) {
-      const errorData = await orderResponse.json();
-      throw new Error(errorData.error || 'Order creation failed');
+    if (!orderRes.ok) {
+      const errData = await orderRes.json().catch(() => ({}));
+      throw new Error(errData.error || `Order creation failed with status ${orderRes.status}`);
     }
 
-    const order = await orderResponse.json();
+    const order = await orderRes.json();
+    console.log('[Payment] Order created:', { id: order.id, amount: order.amount, currency: order.currency });
 
-    // Get form data
+    // Step 4: Get customer info from form
     const formData = new FormData(e.target);
     const customerInfo = {
-      name: formData.get('name'),
-      email: formData.get('email'),
-      contact: formData.get('phone'),
+      name: formData.get('name') || '',
+      email: formData.get('email') || '',
+      contact: formData.get('phone') || '',
     };
+    console.log('[Payment] Customer info collected:', { name: customerInfo.name, email: customerInfo.email });
 
-    // Razorpay options
-    const options = {
+    // Step 5: Re-enable button before opening Razorpay popup
+    // (user may need to interact if popup is blocked)
+    btn.disabled = false;
+    btn.innerHTML = originalHTML;
+
+    // Step 6: Open Razorpay checkout
+    const razorpayOptions = {
       key: razorpayKeyId,
-      amount: order.amount,
-      currency: order.currency,
+      amount: order.amount,         // in paise, as returned by backend
+      currency: order.currency || 'INR',
       name: 'Premium 3D Bakery',
       description: `Order #${order.receipt}`,
-      order_id: order.id,
+      order_id: order.id,           // CRITICAL: must match order created on server
       prefill: customerInfo,
       theme: { color: '#d97706' },
-      handler: async (response) => {
-        try {
-          showToast('Verifying payment...', 'info');
 
-          const verifyResponse = await fetch('/api/verify-payment', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(response),
-          });
+      // ✅ FIX: handler must be a plain (non-async) function.
+      // We kick off an async flow inside but don't await at the top level,
+      // preventing Razorpay from receiving an unresolved Promise.
+      handler: function(response) {
+        console.log('[Payment] Razorpay handler called with response:', {
+          order_id: response.razorpay_order_id,
+          payment_id: response.razorpay_payment_id,
+          signature: response.razorpay_signature ? '✅ present' : '❌ missing',
+        });
 
-          const verifyResult = await verifyResponse.json();
+        // Show immediate feedback so user knows something is happening
+        showToast('Payment received! Verifying...', 'success');
 
-          if (verifyResult.success) {
-            Cart.clearCart();
-            showToast('Payment successful! Redirecting...', 'success');
-            setTimeout(() => Router.navigate('#/success'), 1500);
-          } else {
-            throw new Error(verifyResult.message || 'Payment verification failed');
-          }
-        } catch (error) {
-          console.error('Verification error:', error);
-          showToast('Payment verification failed. Please contact support.', 'error');
+        // Disable pay button to prevent double-submit if user goes back
+        const payBtn = document.getElementById('pay-btn');
+        if (payBtn) {
+          payBtn.disabled = true;
+          payBtn.innerHTML = '<div class="spinner"></div> Verifying...';
         }
+
+        // ✅ Fire async verification — NOT awaited at handler level
+        verifyAndRedirect(response);
       },
+
       modal: {
-        ondismiss: () => {
+        ondismiss: function() {
+          console.log('[Payment] Razorpay modal dismissed by user');
           showToast('Payment cancelled', 'info');
-        }
-      }
+          // Re-enable pay button if modal is dismissed
+          const payBtn = document.getElementById('pay-btn');
+          if (payBtn) {
+            payBtn.disabled = false;
+            payBtn.innerHTML = originalHTML;
+          }
+        },
+        // Escape key should not close modal accidentally
+        escape: false,
+        // Prevent backdrop click from closing
+        backdropclose: false,
+      },
+
+      // Retry config — allow user to retry on payment failure
+      retry: {
+        enabled: true,
+        max_count: 3,
+      },
     };
 
-    // Open Razorpay checkout
-    const razorpayInstance = new window.Razorpay(options);
-    razorpayInstance.open();
+    console.log('[Payment] Opening Razorpay checkout...');
+    const rzpInstance = new window.Razorpay(razorpayOptions);
 
-  } catch (error) {
-    console.error('Payment error:', error);
-    let message = 'Something went wrong. Please try again.';
+    // Handle payment failure from Razorpay side (card declined, etc.)
+    rzpInstance.on('payment.failed', function(failureResponse) {
+      console.error('[Payment] ❌ Payment failed:', failureResponse.error);
+      showToast(
+        `Payment failed: ${failureResponse.error.description || 'Unknown error'}`,
+        'error'
+      );
+      const payBtn = document.getElementById('pay-btn');
+      if (payBtn) {
+        payBtn.disabled = false;
+        payBtn.innerHTML = originalHTML;
+      }
+    });
 
-    if (error.message.includes('configuration')) {
-      message = 'Payment gateway not configured. Please contact support.';
-    } else if (error.message.includes('network') || error.message.includes('fetch')) {
-      message = 'Network error. Please check your connection.';
-    } else if (error.message) {
-      message = error.message;
+    rzpInstance.open();
+
+  } catch (err) {
+    console.error('[Payment] handlePayment error:', err);
+
+    let userMessage = 'Something went wrong. Please try again.';
+    if (err.message.includes('config') || err.message.includes('key')) {
+      userMessage = 'Payment gateway not configured. Please contact support.';
+    } else if (err.message.includes('network') || err.message.includes('fetch') || err.message.includes('Failed to fetch')) {
+      userMessage = 'Network error. Please check your connection and try again.';
+    } else if (err.message.includes('SDK') || err.message.includes('load')) {
+      userMessage = 'Could not load payment gateway. Please refresh the page.';
+    } else if (err.message) {
+      userMessage = err.message;
     }
 
-    showToast(message, 'error');
-  } finally {
+    showToast(userMessage, 'error');
     btn.disabled = false;
-    btn.innerHTML = originalText;
+    btn.innerHTML = originalHTML;
   }
 }
 
@@ -938,7 +1055,6 @@ const Router = {
     const path = hash.replace('#', '') || '/';
     window.scrollTo(0, 0);
 
-    // Active nav link
     document.querySelectorAll('.nav-link, .mobile-link').forEach(a => {
       const h = a.getAttribute('href');
       a.classList.toggle('active', h === hash || (hash === '' && h === '#/'));
@@ -955,13 +1071,15 @@ const Router = {
     }
 
     updateCartBadge();
-    // Close mobile nav
     document.getElementById('mobile-nav')?.classList.remove('open');
     document.getElementById('mobile-menu-btn')?.classList.remove('open');
   },
 
   init() {
-    window.addEventListener('hashchange', () => this.navigate(location.hash));
+    window.addEventListener('hashchange', () => {
+      console.log('[Router] Hash changed to:', location.hash);
+      this.navigate(location.hash);
+    });
     this.navigate(location.hash || '#/');
   }
 };
