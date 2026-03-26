@@ -1,6 +1,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+/* ==================== API CONFIG ==================== */
+const API_BASE_URL = 'https://bakery-backend-production-dbeb.up.railway.app';
+
 /* ==================== DATA ==================== */
 const PRODUCTS = [
   { id: '1', name: 'Almond Stick', price: 1, description: 'Crunchy sticks loaded with premium roasted almonds.', category: 'Sticks', color: '#D2B48C', modelType: 'stick' },
@@ -815,7 +818,7 @@ async function handlePayment(e) {
 
     // Fetch Razorpay config
     showToast('Initializing payment...', 'info');
-    const configResponse = await fetch('/api/config');
+    const configResponse = await fetch(`${API_BASE_URL}/api/config`);
     if (!configResponse.ok) {
       const configError = await configResponse.json().catch(() => ({}));
       throw new Error(configError.error || 'Payment configuration failed');
@@ -823,7 +826,7 @@ async function handlePayment(e) {
     const { razorpayKeyId } = await configResponse.json();
 
     // Create order
-    const orderResponse = await fetch('/api/create-order', {
+    const orderResponse = await fetch(`${API_BASE_URL}/api/create-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ amount: total }),
@@ -858,7 +861,7 @@ async function handlePayment(e) {
         try {
           showToast('Verifying payment...', 'info');
 
-          const verifyResponse = await fetch('/api/verify-payment', {
+          const verifyResponse = await fetch(`${API_BASE_URL}/api/verify-payment`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(response),
