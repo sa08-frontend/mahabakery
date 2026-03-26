@@ -2,7 +2,18 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 /* ==================== API CONFIG ==================== */
-const API_BASE_URL = 'https://bakery-backend-production-dbeb.up.railway.app';
+// Ensure your Razorpay dashboard allowed domains include:
+// - http://localhost:5500
+// - http://127.0.0.1:5500
+// - https://bakery-backend-production-dbeb.up.railway.app
+
+const IS_LOCAL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const LOCAL_API_URL = 'http://127.0.0.1:3000';
+const PROD_API_URL = 'https://bakery-backend-production-dbeb.up.railway.app';
+
+const API_BASE_URL = IS_LOCAL ? LOCAL_API_URL : PROD_API_URL;
+
+// Razorpay key is fetched from backend /api/config to avoid frontend key drift and ensure the key matches account
 
 /* ==================== DATA ==================== */
 const PRODUCTS = [
@@ -803,57 +814,114 @@ async function handlePayment(e) {
   const originalText = btn.innerHTML;
   btn.innerHTML = '<div class="spinner"></div> Processing...';
 
+  // Retry configuration
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 2000; // 2 seconds
+  const API_TIMEOUT = 30000; // 30 seconds
+
+  // Helper function to create fetch with timeout
+  const fetchWithTimeout = (url, options = {}) => {
+    return Promise.race([
+      fetch(url, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers
+        }
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Request timeout')), API_TIMEOUT)
+      )
+    ]);
+  };
+
+  // Helper function to retry API calls
+  const retryApiCall = async (apiCall, retries = MAX_RETRIES) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await apiCall();
+      } catch (error) {
+        console.warn(`API call attempt ${i + 1} failed:`, error.message);
+
+        if (i === retries - 1) throw error; // Last attempt failed
+
+        // Wait before retrying (exponential backoff)
+        const delay = RETRY_DELAY * Math.pow(2, i);
+        showToast(`Retrying in ${delay / 1000}s... (${i + 1}/${retries})`, 'info');
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
   try {
-    // Load Razorpay script if not loaded
+    // Step 1: Load Razorpay script if not loaded
     if (!window.Razorpay) {
       showToast('Loading payment gateway...', 'info');
       await new Promise((resolve, reject) => {
         const script = document.createElement('script');
         script.src = 'https://checkout.razorpay.com/v1/checkout.js';
         script.onload = resolve;
-        script.onerror = () => reject(new Error('Failed to load Razorpay'));
+        script.onerror = () => reject(new Error('Failed to load Razorpay checkout script'));
         document.head.appendChild(script);
       });
     }
 
-    // Fetch Razorpay config
+    // Step 2: Fetch Razorpay configuration with retry
     showToast('Initializing payment...', 'info');
-    const configResponse = await fetch(`${API_BASE_URL}/api/config`);
-    if (!configResponse.ok) {
-      const configError = await configResponse.json().catch(() => ({}));
-      throw new Error(configError.error || 'Payment configuration failed');
-    }
-    const { razorpayKeyId } = await configResponse.json();
-
-    // Create order
-    const orderResponse = await fetch(`${API_BASE_URL}/api/create-order`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amount: total }),
+    const configResponse = await retryApiCall(async () => {
+      const response = await fetchWithTimeout(`${API_BASE_URL}/api/config`);
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Configuration failed' }));
+        throw new Error(errorData.error || 'Payment configuration failed');
+      }
+      return response;
     });
 
-    if (!orderResponse.ok) {
-      const errorData = await orderResponse.json();
-      throw new Error(errorData.error || 'Order creation failed');
+    const { razorpayKeyId } = await configResponse.json();
+    if (!razorpayKeyId) {
+      throw new Error('Invalid Razorpay configuration received');
     }
 
-    const order = await orderResponse.json();
+    // Step 3: Create order with retry
+    showToast('Creating payment order...', 'info');
+    const orderResponse = await retryApiCall(async () => {
+      const response = await fetchWithTimeout(`${API_BASE_URL}/api/create-order`, {
+        method: 'POST',
+        body: JSON.stringify({ amount: total, currency: 'INR' }),
+      });
 
-    // Get form data
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Order creation failed' }));
+        throw new Error(errorData.error || 'Order creation failed');
+      }
+      return response;
+    });
+
+    const order = await orderResponse.json();
+    if (!order.id || !order.amount) {
+      throw new Error('Invalid order data received from server');
+    }
+
+    // Step 4: Get form data and validate
     const formData = new FormData(e.target);
     const customerInfo = {
-      name: formData.get('name'),
-      email: formData.get('email'),
-      contact: formData.get('phone'),
+      name: formData.get('name')?.trim(),
+      email: formData.get('email')?.trim(),
+      contact: formData.get('phone')?.trim(),
     };
 
-    // Razorpay options
+    // Basic validation
+    if (!customerInfo.name || !customerInfo.email || !customerInfo.contact) {
+      throw new Error('Please fill in all required fields');
+    }
+
+    // Step 5: Configure Razorpay options
     const options = {
       key: razorpayKeyId,
       amount: order.amount,
-      currency: order.currency,
+      currency: order.currency || 'INR',
       name: 'Premium 3D Bakery',
-      description: `Order #${order.receipt}`,
+      description: `Order #${order.receipt || order.id}`,
       order_id: order.id,
       prefill: customerInfo,
       theme: { color: '#d97706' },
@@ -861,10 +929,18 @@ async function handlePayment(e) {
         try {
           showToast('Verifying payment...', 'info');
 
-          const verifyResponse = await fetch(`${API_BASE_URL}/api/verify-payment`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(response),
+          // Step 6: Verify payment with retry
+          const verifyResponse = await retryApiCall(async () => {
+            const res = await fetchWithTimeout(`${API_BASE_URL}/api/verify-payment`, {
+              method: 'POST',
+              body: JSON.stringify(response),
+            });
+
+            if (!res.ok) {
+              const errorData = await res.json().catch(() => ({ message: 'Verification failed' }));
+              throw new Error(errorData.message || 'Payment verification failed');
+            }
+            return res;
           });
 
           const verifyResult = await verifyResponse.json();
@@ -878,36 +954,60 @@ async function handlePayment(e) {
           }
         } catch (error) {
           console.error('Verification error:', error);
-          showToast('Payment verification failed. Please contact support.', 'error');
+          showToast('Payment verification failed. Please contact support if amount was debited.', 'error');
         }
       },
       modal: {
         ondismiss: () => {
           showToast('Payment cancelled', 'info');
-        }
-      }
+          btn.disabled = false;
+          btn.innerHTML = originalText;
+        },
+        confirm_close: true,
+        escape: true,
+        animation: true
+      },
+      retry: {
+        enabled: true,
+        max_count: 2
+      },
+      timeout: 300, // 5 minutes
+      remember_customer: true
     };
 
-    // Open Razorpay checkout
+    // Step 7: Open Razorpay checkout
+    showToast('Opening payment gateway...', 'info');
     const razorpayInstance = new window.Razorpay(options);
     razorpayInstance.open();
 
   } catch (error) {
     console.error('Payment error:', error);
-    let message = 'Something went wrong. Please try again.';
 
-    if (error.message.includes('configuration')) {
-      message = 'Payment gateway not configured. Please contact support.';
+    let message = 'Something went wrong. Please try again.';
+    let type = 'error';
+
+    if (error.message.includes('timeout')) {
+      message = 'Request timed out. Please check your connection and try again.';
     } else if (error.message.includes('network') || error.message.includes('fetch')) {
-      message = 'Network error. Please check your connection.';
+      message = 'Network error. Please check your internet connection.';
+    } else if (error.message.includes('configuration') || error.message.includes('Invalid Razorpay')) {
+      message = 'Payment gateway configuration error. Please contact support.';
+    } else if (error.message.includes('Invalid order data')) {
+      message = 'Order creation failed. Please try again.';
+    } else if (error.message.includes('fill in all required fields')) {
+      message = 'Please fill in all required fields.';
+      type = 'warning';
     } else if (error.message) {
       message = error.message;
     }
 
-    showToast(message, 'error');
+    showToast(message, type);
   } finally {
-    btn.disabled = false;
-    btn.innerHTML = originalText;
+    // Re-enable button if payment was cancelled or failed
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.innerHTML = originalText;
+    }, 1000);
   }
 }
 
